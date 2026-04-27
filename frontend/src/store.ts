@@ -22,14 +22,47 @@ export type View =
       source: "video" | "glb";
     };
 
+export type Pt = [number, number, number];
+
 type Store = {
   view: View;
   setView: (v: View) => void;
   reset: () => void;
+
+  // Measurement state. `picked` is in world (post-scale-group) coordinates.
+  picked: Pt[];
+  pick: (p: Pt) => void;
+  clearPicks: () => void;
+
+  // Reference: meters per world unit. Null until user calibrates.
+  metersPerUnit: number | null;
+  setReferenceMeters: (meters: number) => void;
+  clearReference: () => void;
 };
 
-export const useStore = create<Store>((set) => ({
+export const useStore = create<Store>((set, get) => ({
   view: { kind: "idle" },
-  setView: (view) => set({ view }),
-  reset: () => set({ view: { kind: "idle" } }),
+  setView: (view) => set({ view, picked: [], metersPerUnit: null }),
+  reset: () => set({ view: { kind: "idle" }, picked: [], metersPerUnit: null }),
+
+  picked: [],
+  pick: (p) =>
+    set((s) => {
+      // After two picks, the next click starts a fresh measurement.
+      if (s.picked.length >= 2) return { picked: [p] };
+      return { picked: [...s.picked, p] };
+    }),
+  clearPicks: () => set({ picked: [] }),
+
+  metersPerUnit: null,
+  setReferenceMeters: (meters) => {
+    const { picked } = get();
+    if (picked.length !== 2 || meters <= 0) return;
+    const [a, b] = picked;
+    const dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    const worldDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (worldDist <= 1e-6) return;
+    set({ metersPerUnit: meters / worldDist });
+  },
+  clearReference: () => set({ metersPerUnit: null }),
 }));

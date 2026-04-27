@@ -95,6 +95,54 @@ def make_axis_triad(length: float = 0.5, thickness: float = 0.01) -> trimesh.Tri
     return trimesh.util.concatenate(parts)
 
 
+def mesh_from_frame_grid(world_points: np.ndarray, image: np.ndarray, conf: np.ndarray,
+                         conf_thr: float, edge_thr: float, stride: int = 1):
+    """Convert a single frame's [H,W,3] world_points grid into a triangle mesh.
+
+    Each stride-spaced 2x2 pixel block becomes 2 triangles. We drop quads where any
+    vertex is below confidence or where any edge is longer than `edge_thr` (depth
+    discontinuities at object boundaries — meshing across them produces the
+    "spaghetti" surfaces that connect foreground to background).
+    """
+    if stride > 1:
+        world_points = world_points[::stride, ::stride]
+        image = image[::stride, ::stride]
+        conf = conf[::stride, ::stride]
+    H, W, _ = world_points.shape
+    verts = world_points.reshape(-1, 3).astype(np.float32)
+    cols = image.reshape(-1, 3).astype(np.uint8)
+    flat_conf = conf.reshape(-1)
+
+    idx = np.arange(H * W).reshape(H, W)
+    i00 = idx[:-1, :-1].ravel()
+    i01 = idx[:-1, 1:].ravel()
+    i10 = idx[1:, :-1].ravel()
+    i11 = idx[1:, 1:].ravel()
+
+    quad_conf_ok = (
+        (flat_conf[i00] >= conf_thr)
+        & (flat_conf[i01] >= conf_thr)
+        & (flat_conf[i10] >= conf_thr)
+        & (flat_conf[i11] >= conf_thr)
+    )
+
+    # Edge-length check: any edge longer than edge_thr -> discontinuity.
+    e_top = np.linalg.norm(verts[i01] - verts[i00], axis=1)
+    e_left = np.linalg.norm(verts[i10] - verts[i00], axis=1)
+    e_diag = np.linalg.norm(verts[i11] - verts[i00], axis=1)
+    e_right = np.linalg.norm(verts[i11] - verts[i01], axis=1)
+    e_bot = np.linalg.norm(verts[i11] - verts[i10], axis=1)
+    edge_ok = (e_top < edge_thr) & (e_left < edge_thr) & (e_diag < edge_thr) & (e_right < edge_thr) & (e_bot < edge_thr)
+
+    keep = quad_conf_ok & edge_ok
+    if not np.any(keep):
+        return None
+    f1 = np.stack([i00[keep], i01[keep], i11[keep]], axis=1)
+    f2 = np.stack([i00[keep], i11[keep], i10[keep]], axis=1)
+    faces = np.concatenate([f1, f2], axis=0)
+    return verts, cols, faces
+
+
 def voxel_downsample(points: np.ndarray, colors: np.ndarray, voxel_size: float):
     """Per-voxel mean using a hash on integer cell coords. Stable, no open3d needed."""
     cells = np.floor(points / voxel_size).astype(np.int64)
@@ -124,6 +172,13 @@ def main() -> int:
                    help="drop points farther than this multiple of the trajectory bbox diagonal from any camera center")
     p.add_argument("--frame-pose-mad", type=float, default=3.0,
                    help="drop entire frames whose camera position is more than this many MADs from the trajectory median")
+    p.add_argument("--mode", choices=["mesh", "cloud"], default="mesh",
+                   help="mesh = per-frame triangle mesh from world_points grid (default, looks like surfaces); "
+                        "cloud = legacy colored point cloud")
+    p.add_argument("--edge-multiple", type=float, default=0.03,
+                   help="for mesh mode, drop quad edges longer than this multiple of frame median depth (depth discontinuity filter)")
+    p.add_argument("--stride", type=int, default=2,
+                   help="for mesh mode, sample every Nth pixel of the grid (default 2 = 4x smaller mesh)")
     args = p.parse_args()
 
     json_files = sorted(args.recon_dir.glob("image_*.json"))
@@ -158,8 +213,10 @@ def main() -> int:
     frame_keep = frame_pose_ok & frame_depth_ok
     print(f"Frame filter: kept {frame_keep.sum()}/{len(json_files)} (rejected pose-outliers={(~frame_pose_ok).sum()}, depth-outliers={(~frame_depth_ok).sum()})")
 
-    # ---- Pass 2: build the cloud only from kept frames ----
-    all_pts, all_cols, cam_centers, frustums = [], [], [], []
+    # ---- Pass 2: build cloud OR mesh from kept frames ----
+    cam_centers, frustums = [], []
+    frame_meshes = []   # list of (verts, cols, faces) per frame for mesh mode
+    all_pts, all_cols = [], []  # for cloud mode
 
     for i, (jp, d, pose_enc) in enumerate(payloads):
         if not frame_keep[i]:
@@ -173,52 +230,76 @@ def main() -> int:
         wp = decode_array(d["world_points"])
         wpc = decode_array(d["world_points_conf"])
         img = decode_array(d["image"])
-        depth = decode_array(d["depth"]).reshape(-1)
+        depth = decode_array(d["depth"])
+        med_d = float(np.median(depth))
 
-        H, W, _ = wp.shape
-        pts = wp.reshape(-1, 3)
-        cols = img.reshape(-1, 3)
-        confs = wpc.reshape(-1)
-
-        # Per-frame depth outlier filter: drop points farther than depth_multiple * median depth (those tend to be behind walls)
-        med_d = np.median(depth)
-        keep = depth <= med_d * args.depth_multiple
-        # Stricter confidence cutoff
-        keep &= confs >= np.quantile(confs, args.conf_quantile)
-
-        pts, cols = pts[keep], cols[keep]
-        all_pts.append(pts.astype(np.float32))
-        all_cols.append(cols.astype(np.uint8))
-        print(f"  {jp.name}: kept {len(pts):,} / {H*W:,} pts (median_depth={med_d:.2f})")
-
-    points = np.concatenate(all_pts, axis=0)
-    colors = np.concatenate(all_cols, axis=0)
-    print(f"Combined: {len(points):,} points")
-
-    # Trajectory-radius filter: drop points farther than traj_radius_factor * traj_diag from any camera center
-    cam_arr = np.array(cam_centers, dtype=np.float32)
-    traj_diag = float(np.linalg.norm(cam_arr.max(axis=0) - cam_arr.min(axis=0))) + 1e-6
-    radius_cap = max(traj_diag * args.traj_radius_factor, 0.5)  # never below 0.5 canonical units
-    # nearest-camera distance via chunked sklearn-free pairwise
-    chunk = 100_000
-    keep_global = np.zeros(len(points), dtype=bool)
-    for i in range(0, len(points), chunk):
-        sub = points[i:i + chunk]
-        d2 = ((sub[:, None, :] - cam_arr[None, :, :]) ** 2).sum(-1).min(axis=1)
-        keep_global[i:i + chunk] = d2 <= radius_cap * radius_cap
-    points = points[keep_global]
-    colors = colors[keep_global]
-    print(f"Trajectory-radius filter (cap={radius_cap:.2f}): kept {len(points):,} pts")
-
-    points, colors = voxel_downsample(points, colors.astype(np.float64), args.voxel)
-    print(f"After voxel ({args.voxel}): {len(points):,} points")
-
-    # Pad RGB to RGBA for trimesh PointCloud color field.
-    rgba = np.concatenate([colors, np.full((len(colors), 1), 255, dtype=np.uint8)], axis=1)
-    pc = trimesh.points.PointCloud(vertices=points, colors=rgba)
+        if args.mode == "mesh":
+            conf_thr = float(np.quantile(wpc, args.conf_quantile))
+            edge_thr = med_d * args.edge_multiple
+            res = mesh_from_frame_grid(wp, img, wpc, conf_thr=conf_thr, edge_thr=edge_thr, stride=args.stride)
+            if res is None:
+                print(f"  {jp.name}: SKIP (no surviving quads)")
+                continue
+            verts, cols, faces = res
+            frame_meshes.append((verts, cols, faces))
+            print(f"  {jp.name}: {len(faces):>7,} tris (median_depth={med_d:.2f})")
+        else:
+            H, W, _ = wp.shape
+            pts = wp.reshape(-1, 3)
+            cols = img.reshape(-1, 3)
+            confs = wpc.reshape(-1)
+            depth_flat = depth.reshape(-1)
+            keep = depth_flat <= med_d * args.depth_multiple
+            keep &= confs >= np.quantile(confs, args.conf_quantile)
+            pts, cols = pts[keep], cols[keep]
+            all_pts.append(pts.astype(np.float32))
+            all_cols.append(cols.astype(np.uint8))
+            print(f"  {jp.name}: kept {len(pts):,} / {H*W:,} pts (median_depth={med_d:.2f})")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    scene = trimesh.Scene(pc)
+    scene = trimesh.Scene()
+
+    if args.mode == "mesh":
+        # Concatenate every frame's quad mesh, offsetting face indices.
+        all_verts = []
+        all_cols_m = []
+        all_faces = []
+        v_offset = 0
+        for verts, cols, faces in frame_meshes:
+            all_verts.append(verts)
+            all_cols_m.append(cols)
+            all_faces.append(faces + v_offset)
+            v_offset += len(verts)
+        big_verts = np.concatenate(all_verts, axis=0)
+        big_cols = np.concatenate(all_cols_m, axis=0)
+        big_faces = np.concatenate(all_faces, axis=0)
+        rgba = np.concatenate([big_cols, np.full((len(big_cols), 1), 255, dtype=np.uint8)], axis=1)
+        big_mesh = trimesh.Trimesh(vertices=big_verts, faces=big_faces, vertex_colors=rgba, process=False)
+        scene.add_geometry(big_mesh)
+        print(f"Mesh: {len(big_verts):,} verts, {len(big_faces):,} tris from {len(frame_meshes)} frames")
+        cloud_extent_pts = big_verts
+    else:
+        points = np.concatenate(all_pts, axis=0)
+        colors = np.concatenate(all_cols, axis=0)
+        print(f"Combined: {len(points):,} points")
+        cam_arr = np.array(cam_centers, dtype=np.float32)
+        traj_diag = float(np.linalg.norm(cam_arr.max(axis=0) - cam_arr.min(axis=0))) + 1e-6
+        radius_cap = max(traj_diag * args.traj_radius_factor, 0.5)
+        chunk = 100_000
+        keep_global = np.zeros(len(points), dtype=bool)
+        for i in range(0, len(points), chunk):
+            sub = points[i:i + chunk]
+            d2 = ((sub[:, None, :] - cam_arr[None, :, :]) ** 2).sum(-1).min(axis=1)
+            keep_global[i:i + chunk] = d2 <= radius_cap * radius_cap
+        points = points[keep_global]
+        colors = colors[keep_global]
+        print(f"Trajectory-radius filter (cap={radius_cap:.2f}): kept {len(points):,} pts")
+        points, colors = voxel_downsample(points, colors.astype(np.float64), args.voxel)
+        print(f"After voxel ({args.voxel}): {len(points):,} points")
+        rgba = np.concatenate([colors, np.full((len(colors), 1), 255, dtype=np.uint8)], axis=1)
+        pc = trimesh.points.PointCloud(vertices=points, colors=rgba)
+        scene.add_geometry(pc)
+        cloud_extent_pts = points
 
     # Camera trajectory: a polyline through cam centers + a frustum at each.
     if len(cam_centers) >= 2:
@@ -230,13 +311,13 @@ def main() -> int:
     for fr in frustums:
         scene.add_geometry(fr)
 
-    # Axis triad scaled to the cloud's footprint so it's visible but not overwhelming.
-    cloud_extent = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+    # Axis triad scaled to the cloud/mesh footprint so it's visible but not overwhelming.
+    cloud_extent = float(np.linalg.norm(cloud_extent_pts.max(axis=0) - cloud_extent_pts.min(axis=0)))
     scene.add_geometry(make_axis_triad(length=cloud_extent * 0.15, thickness=cloud_extent * 0.003))
 
     scene.export(args.out)
     size_mb = args.out.stat().st_size / 1e6
-    print(f"Wrote {args.out} ({size_mb:.1f} MB) — {len(frustums)} camera frustums + axis triad embedded")
+    print(f"Wrote {args.out} ({size_mb:.1f} MB) - mode={args.mode}, {len(frustums)} frustums + axis triad embedded")
     return 0
 
 
