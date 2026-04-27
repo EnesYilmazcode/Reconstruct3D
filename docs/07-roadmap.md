@@ -4,17 +4,18 @@ Two parallel tracks. Track A is the personal-utility deadline; Track B is the po
 
 ## Track A — get the apartment dimensions answered (this week)
 
-### Day 1 (≤2 hours)
+### Day 1 (≤1 hour)
 
 - [ ] Drop video into `data/raw/apartment.mp4`. Eyeball it: identify candidate reference objects (door, light switch, outlet, window). Note timestamps where each appears clearly.
-- [ ] `pip install ffmpeg-python replicate open3d trimesh rerun-sdk numpy pillow`.
-- [ ] `scripts/extract_frames.py` — wrap ffmpeg, sample at 2 fps, scale to 518px, cap at 60 frames. Save thumbnails for previewing.
+- [ ] `pip install replicate open3d trimesh rerun-sdk numpy pillow`. (No ffmpeg-python needed for Track A — the Replicate model accepts video directly.)
+- [ ] If the video is longer than the Replicate model's max input duration, trim it once with a one-off `ffmpeg -ss 0 -t 30 -c copy ...`. Otherwise skip.
+- [ ] `REPLICATE_API_TOKEN` exported in shell (see `KEYS.local.md`). Set a $5 spend limit on the Replicate billing page first.
 
 ### Day 2 (≤3 hours)
 
-- [ ] `scripts/run_replicate_vggt.py` — call `vufinder/vggt-1b-depth` on the extracted frames in a single batch. Save the returned GLB + camera params to `data/recon/`.
+- [ ] `scripts/run_replicate_vggt.py` — call `vufinder/vggt-1b` on `data/raw/apartment.mp4` directly. Pin the version digest. Persist every URL in `output["data"]` to `data/recon/` and label which is the GLB vs. depth vs. camera params on first run.
 - [ ] Open the GLB in a viewer (Blender, or `python -c "import rerun ..."`) and confirm the geometry looks like the apartment.
-- [ ] If geometry is garbage: try fewer frames, a different fps, or chunk into two halves. Re-run.
+- [ ] If geometry is garbage: try a shorter clip (trim to a single room) or a slower-pan section. Re-run.
 
 ### Day 3 (≤2 hours)
 

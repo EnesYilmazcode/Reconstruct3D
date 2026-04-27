@@ -71,17 +71,31 @@ Don't build the Modal worker on day one. Use Replicate for the first end-to-end 
 
 ```python
 import replicate
+
+# Pin the version digest so reruns are reproducible while iterating on metric scaling.
+MODEL = "vufinder/vggt-1b:8f588e57226dc37aecdfceda935eac3ab3f8632b48d385a6c2d86cf6bf73cd23"
+
 output = replicate.run(
-    "vufinder/vggt-1b-depth",
-    input={"images": [open(f, "rb") for f in frame_paths[:24]]},
+    MODEL,
+    input={
+        "inputs": [open("data/raw/apartment.mp4", "rb")],  # array — model accepts video files directly
+        "normals": True,
+        "point_scales": True,
+        "alpha_blend_onto": "keep",
+        "weighted_pose_transform": True,
+        "enable_pose_postprocessing": True,
+    },
 )
-# output["glb"] is a URL to the reconstruction
+# output["data"] is a list of URLs (GLB + auxiliary files: depth, normals, camera params).
+# On the first run, dump and label each URL so the downstream metric-scaling notebook
+# knows which to fetch.
 ```
 
 Caveats:
-- Uses VGGT-1B-Commercial weights — point map head removed; we'd need to derive points from depth.
-- Doesn't run UniDepth — Track A scaling has to use a manual reference object instead.
+- Runs on **L40S** with status "Cold" — first call after idle has a ~30–60 s warmup.
+- Doesn't run UniDepth — Track A scaling has to use a manual reference object instead (see [`04-metric-scaling.md`](04-metric-scaling.md), Strategy 1).
 - Cost: ~$0.05–0.20 per video. Fine for testing, painful for production.
+- The model handles frame extraction internally, so the Track A path skips Stage 0 of [`03-pipeline.md`](03-pipeline.md).
 
 Plan: ship Track A using Replicate + manual scaling. Build the Modal worker for Track B.
 

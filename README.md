@@ -19,7 +19,7 @@ Track A is hand-tooled (manual reference-object scaling on a Jupyter notebook). 
 
 - **Geometry**: VGGT-1B (Meta, feed-forward video → point cloud + camera poses)
 - **Metric scale**: UniDepth v2 (primary) + door/ceiling reference (sanity check)
-- **Compute**: Modal A10G ($1.10/hr, scales to zero) — Replicate `vufinder/vggt-1b-depth` as fallback for first end-to-end demo
+- **Compute**: Modal A10G ($1.10/hr, scales to zero) — Replicate `vufinder/vggt-1b` as fallback for first end-to-end demo (full model, runs on L40S, accepts video files directly)
 - **Viz**: Three.js (custom UI) + Rerun (debug)
 - **Furniture**: IKEA GLB catalog → loaded via `three/examples/jsm/loaders/GLTFLoader`
 
@@ -38,20 +38,50 @@ Read in order:
 
 ## Quickstart for Track A (urgent dimension answer)
 
+Prerequisites:
+- Python 3.11+ with `pip install replicate numpy trimesh`
+- A Replicate API token — see [Setting up the Replicate token](#setting-up-the-replicate-token) below
+- Node 20+ (for the viewer)
+
 ```bash
-# 1. Drop the apartment video at data/raw/apartment.mp4
-# 2. Extract frames
-python scripts/extract_frames.py data/raw/apartment.mp4 --fps 2 --max 60
+# 1. Drop the apartment video at data/raw/apartment.mp4 (long videos: trim first)
+ffmpeg -i source.mp4 -ss 0:42 -to 0:51 -c:v copy -an data/raw/room1.mp4
 
-# 3. Run hosted VGGT (Replicate) — get .glb + camera poses
-python scripts/run_replicate_vggt.py data/frames/ --out data/recon/
+# 2. Run hosted VGGT (Replicate). Returns one JSON per sampled frame
+#    with depth + world_points + pose + normals + image.
+export REPLICATE_API_TOKEN=r8_...
+python scripts/run_replicate_vggt.py data/raw/room1.mp4 --out data/recon/room1
 
-# 4. Open notebooks/scale_from_door.ipynb, click two points on a door
-#    in the .glb, enter 80 inches, get scale factor
-# 5. Apply scale, measure room walls in Blender or Rerun
+# 3. Assemble a colored point-cloud GLB from the per-frame predictions
+python scripts/assemble_glb.py data/recon/room1 --out frontend/public/sample.glb
+
+# 4. View it
+cd frontend && npm install && npm run dev
+# open the printed localhost URL → click "view pre-generated sample"
+
+# 5. (Track A finish) measure walls in the GLB, apply a manual reference-object
+#    scale to convert canonical units → meters. See docs/04-metric-scaling.md.
 ```
 
-Expected wall-clock: ~2 hours from running the video to a numbered floor plan.
+Expected wall-clock: ~2 hours from running the video to a numbered floor plan. The Replicate call itself is ~5–10 s once the model is warm.
+
+### Setting up the Replicate token
+
+1. Sign up at https://replicate.com (GitHub login works).
+2. **Set a hard spend limit first** — Billing → Spend limit → $5 is plenty for Track A. Do this *before* the next step so a runaway job can't drain your card.
+3. Create a token at https://replicate.com/account/api-tokens, name it something memorable.
+4. Export it in your shell (or write it to a `.env` at the repo root — already gitignored):
+   ```bash
+   # bash / zsh
+   export REPLICATE_API_TOKEN=r8_...
+   # PowerShell
+   $env:REPLICATE_API_TOKEN = "r8_..."
+   ```
+5. Sanity-check: `echo $REPLICATE_API_TOKEN` (or `$env:REPLICATE_API_TOKEN` on PowerShell).
+
+Cost: ~$0.05–$0.20 per video on `vufinder/vggt-1b` (L40S). The model is "Cold" — first call after idle has a 30–60 s warmup; subsequent calls in the same session are fast.
+
+> Local secret notes (gitignored, not for portfolio readers) live in `KEYS.local.md` if you need a more detailed walkthrough.
 
 ## What this is *not*
 

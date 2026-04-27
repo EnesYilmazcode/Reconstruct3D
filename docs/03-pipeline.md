@@ -1,5 +1,7 @@
 # 03 — Pipeline
 
+This document describes the **self-hosted Track B pipeline** that calls VGGT and UniDepth weights directly from a Modal worker. The Track A path uses the Replicate-hosted model (`vufinder/vggt-1b`), which accepts a video file as input and runs all of Stages 0–2 internally — see [`06-deployment.md`](06-deployment.md#replicate-fallback-for-track-a).
+
 The worker runs a strictly sequential pipeline. Each stage's output is checkpointed to disk so failures mid-run can resume.
 
 ## Stage 0 — Frame extraction (ffmpeg, ~1–3 s)
@@ -51,7 +53,7 @@ Notes:
 
 - Use bfloat16 autocast on A10G/L40S. fp32 doubles VRAM and barely changes output.
 - `pose_enc` is a compact 9-dim representation; convert to 4×4 extrinsic with VGGT's `pose_encoding_to_extri_intri` helper.
-- For the **commercial** weights (VGGT-1B-Commercial), the point-map head is removed — derive points from depth + intrinsics + pose instead. The Replicate `vufinder/vggt-1b-depth` deployment uses these.
+- For the **commercial** weights (VGGT-1B-Commercial), the point-map head is removed — derive points from depth + intrinsics + pose instead. Not used in this project; we self-host the original CC-BY-NC weights for Track B and call `vufinder/vggt-1b` (full model, all heads) for Track A on Replicate.
 
 ## Stage 2 — Convert to point cloud
 

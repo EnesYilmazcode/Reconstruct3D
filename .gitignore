@@ -1,0 +1,32 @@
+# local-only docs (keys, secrets, scratch notes)
+*.local.md
+KEYS.local.md
+.env
+.env.local
+.env.*.local
+
+# data
+data/raw/
+data/frames/
+data/recon/
+*.mp4
+*.mov
+*.webm
+*.glb
+*.ply
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# node
+node_modules/
+dist/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
