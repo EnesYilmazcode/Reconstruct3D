@@ -115,58 +115,100 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("recon_dir", type=Path, help="dir with image_*.json files")
     p.add_argument("--out", type=Path, required=True, help="output .glb path")
-    p.add_argument("--conf-quantile", type=float, default=0.3,
-                   help="drop points below this quantile of world_points_conf (default 0.3 = bottom 30%)")
-    p.add_argument("--voxel", type=float, default=0.01,
-                   help="voxel size in canonical units (VGGT outputs are scale-ambiguous; tune by eye)")
+    p.add_argument("--conf-quantile", type=float, default=0.6,
+                   help="drop points below this quantile of world_points_conf (default 0.6 = bottom 60%)")
+    p.add_argument("--voxel", type=float, default=0.01, help="voxel size in canonical units")
+    p.add_argument("--depth-multiple", type=float, default=2.5,
+                   help="per-frame, drop points whose depth exceeds this multiple of the frame's median depth")
+    p.add_argument("--traj-radius-factor", type=float, default=1.6,
+                   help="drop points farther than this multiple of the trajectory bbox diagonal from any camera center")
+    p.add_argument("--frame-pose-mad", type=float, default=3.0,
+                   help="drop entire frames whose camera position is more than this many MADs from the trajectory median")
     args = p.parse_args()
 
     json_files = sorted(args.recon_dir.glob("image_*.json"))
     print(f"Found {len(json_files)} frame JSONs")
 
-    all_pts = []
-    all_cols = []
-    cam_centers = []
-    frustums = []
-
+    # ---- Pass 1: collect poses and median depths so we can reject bad frames ----
+    poses, med_depths, payloads = [], [], []
     for jp in json_files:
         d = json.loads(jp.read_text())
-        wp = decode_array(d["world_points"])          # [H, W, 3]
-        wpc = decode_array(d["world_points_conf"])    # [H, W]
-        img = decode_array(d["image"])                # [H, W, 3] uint8
-
-        # Decode camera pose. VGGT pose_enc layout = [tx, ty, tz, qx, qy, qz, qw, fx, fy].
         pose_enc = decode_array(d["pose_enc"])
+        depth = decode_array(d["depth"])
+        poses.append(pose_enc[:3].astype(np.float32))
+        med_depths.append(float(np.median(depth)))
+        payloads.append((jp, d, pose_enc))
+    poses = np.array(poses)
+    med_depths = np.array(med_depths)
+
+    # Reject frames whose pose center is way off the trajectory median (likely a tracking failure)
+    pose_median = np.median(poses, axis=0)
+    pose_dev = np.linalg.norm(poses - pose_median, axis=1)
+    pose_mad = np.median(np.abs(pose_dev - np.median(pose_dev))) + 1e-6
+    pose_threshold = np.median(pose_dev) + args.frame_pose_mad * 1.4826 * pose_mad
+    frame_pose_ok = pose_dev <= pose_threshold
+
+    # Reject frames whose median depth is anomalous (motion-blurred frames often have abnormally high/low median depth)
+    md_median = np.median(med_depths)
+    md_mad = np.median(np.abs(med_depths - md_median)) + 1e-6
+    md_threshold_lo = md_median - 3 * 1.4826 * md_mad
+    md_threshold_hi = md_median + 3 * 1.4826 * md_mad
+    frame_depth_ok = (med_depths >= md_threshold_lo) & (med_depths <= md_threshold_hi)
+
+    frame_keep = frame_pose_ok & frame_depth_ok
+    print(f"Frame filter: kept {frame_keep.sum()}/{len(json_files)} (rejected pose-outliers={(~frame_pose_ok).sum()}, depth-outliers={(~frame_depth_ok).sum()})")
+
+    # ---- Pass 2: build the cloud only from kept frames ----
+    all_pts, all_cols, cam_centers, frustums = [], [], [], []
+
+    for i, (jp, d, pose_enc) in enumerate(payloads):
+        if not frame_keep[i]:
+            print(f"  {jp.name}: SKIP (outlier frame)")
+            continue
         t = pose_enc[:3].astype(np.float32)
-        q = pose_enc[3:7].astype(np.float32)
-        R = quat_to_rotmat(q)
+        R = quat_to_rotmat(pose_enc[3:7].astype(np.float32))
         cam_centers.append(t)
         frustums.append(make_camera_frustum(t, R))
+
+        wp = decode_array(d["world_points"])
+        wpc = decode_array(d["world_points_conf"])
+        img = decode_array(d["image"])
+        depth = decode_array(d["depth"]).reshape(-1)
 
         H, W, _ = wp.shape
         pts = wp.reshape(-1, 3)
         cols = img.reshape(-1, 3)
         confs = wpc.reshape(-1)
 
-        # Drop the lowest-confidence pixels (background / sky / specular).
-        thr = np.quantile(confs, args.conf_quantile)
-        keep = confs >= thr
-        pts = pts[keep]
-        cols = cols[keep]
+        # Per-frame depth outlier filter: drop points farther than depth_multiple * median depth (those tend to be behind walls)
+        med_d = np.median(depth)
+        keep = depth <= med_d * args.depth_multiple
+        # Stricter confidence cutoff
+        keep &= confs >= np.quantile(confs, args.conf_quantile)
 
-        # VGGT sometimes emits stragglers far behind the camera; clip absurd magnitudes.
-        norms = np.linalg.norm(pts, axis=1)
-        keep = norms < np.quantile(norms, 0.99) * 3
-        pts = pts[keep]
-        cols = cols[keep]
-
+        pts, cols = pts[keep], cols[keep]
         all_pts.append(pts.astype(np.float32))
         all_cols.append(cols.astype(np.uint8))
-        print(f"  {jp.name}: kept {len(pts):,} / {H*W:,} pts")
+        print(f"  {jp.name}: kept {len(pts):,} / {H*W:,} pts (median_depth={med_d:.2f})")
 
     points = np.concatenate(all_pts, axis=0)
     colors = np.concatenate(all_cols, axis=0)
-    print(f"Combined: {len(points):,} points before downsample")
+    print(f"Combined: {len(points):,} points")
+
+    # Trajectory-radius filter: drop points farther than traj_radius_factor * traj_diag from any camera center
+    cam_arr = np.array(cam_centers, dtype=np.float32)
+    traj_diag = float(np.linalg.norm(cam_arr.max(axis=0) - cam_arr.min(axis=0))) + 1e-6
+    radius_cap = max(traj_diag * args.traj_radius_factor, 0.5)  # never below 0.5 canonical units
+    # nearest-camera distance via chunked sklearn-free pairwise
+    chunk = 100_000
+    keep_global = np.zeros(len(points), dtype=bool)
+    for i in range(0, len(points), chunk):
+        sub = points[i:i + chunk]
+        d2 = ((sub[:, None, :] - cam_arr[None, :, :]) ** 2).sum(-1).min(axis=1)
+        keep_global[i:i + chunk] = d2 <= radius_cap * radius_cap
+    points = points[keep_global]
+    colors = colors[keep_global]
+    print(f"Trajectory-radius filter (cap={radius_cap:.2f}): kept {len(points):,} pts")
 
     points, colors = voxel_downsample(points, colors.astype(np.float64), args.voxel)
     print(f"After voxel ({args.voxel}): {len(points):,} points")
