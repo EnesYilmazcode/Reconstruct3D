@@ -27,6 +27,11 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("video", type=Path, help="path to input video file")
     p.add_argument("--out", type=Path, required=True, help="output directory")
+    p.add_argument("--sampling-rate", type=int, default=6,
+                   help="every n-th frame is sampled. Default 6 (~5fps on 30fps source). "
+                        "Model default is 24 which is too sparse for short clips.")
+    p.add_argument("--exclude-original-image", action="store_true",
+                   help="ask the model to drop the 'original_image' key to reduce JSON size")
     args = p.parse_args()
 
     if not os.environ.get("REPLICATE_API_TOKEN"):
@@ -45,19 +50,21 @@ def main() -> int:
     b64 = base64.b64encode(args.video.read_bytes()).decode("ascii")
     data_url = f"data:{mime};base64,{b64}"
 
-    print(f"Calling {MODEL_VERSION.split(':')[0]} ...")
+    model_input = {
+        "inputs": [data_url],
+        "sampling_rate": args.sampling_rate,
+        "normals": True,
+        "point_scales": True,
+        "alpha_blend_onto": "keep",
+        "weighted_pose_transform": True,
+        "enable_pose_postprocessing": True,
+    }
+    if args.exclude_original_image:
+        model_input["keys_to_exclude"] = "original_image"
+
+    print(f"Calling {MODEL_VERSION.split(':')[0]} (sampling_rate={args.sampling_rate}) ...")
     t0 = time.time()
-    output = replicate.run(
-        MODEL_VERSION,
-        input={
-            "inputs": [data_url],
-            "normals": True,
-            "point_scales": True,
-            "alpha_blend_onto": "keep",
-            "weighted_pose_transform": True,
-            "enable_pose_postprocessing": True,
-        },
-    )
+    output = replicate.run(MODEL_VERSION, input=model_input)
     elapsed = time.time() - t0
     print(f"Replicate call returned in {elapsed:.1f}s")
 

@@ -67,7 +67,7 @@ export function loadGlbDirect(file: File) {
 }
 
 const SAMPLE_LOCAL_URL = "/sample.glb";
-const SAMPLE_LABEL = "room1 · vggt-1b · 13 frames";
+const SAMPLE_LABEL = "room1 · vggt-1b · 46 frames + frustums";
 
 export async function loadSampleGlb() {
   const head = await fetch(SAMPLE_LOCAL_URL, { method: "HEAD" }).catch(() => null);
